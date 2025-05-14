@@ -7,7 +7,11 @@ from utils import shared_data
 from queue import Queue
 import math
 import numpy as np
-from tank_env import TankEnv
+import gymnasium as gym
+from gymnasium.spaces import Dict, Box, MultiDiscrete
+from collections import deque
+import threading
+
 
 app = Flask(__name__)
 
@@ -18,8 +22,10 @@ rng = np.random.default_rng(seed=13)
 # 학습 기록을 위한 카운터 변경
 episode_counter = 0
 # 연산 인디케이터 
-calculating = False
+initiating = False
+on_step = False
 striked_target = None
+striked_buffer = 0
 # 발포 여부
 fired = False
 ready_to_shot = False
@@ -45,10 +51,12 @@ os.makedirs(result_dir, exist_ok=True)
 latest_result = os.path.join(result_dir, "latest_result.png")
 
 # 강화학습 관련 변수
-env = TankEnv(max_steps=1000)
 is_env_start = False
-# 타이밍 동기화를 위한 큐 
-data_queue = Queue()
+step_check = False
+prev_action = None
+# 타이밍 동기화를 위한 스택택
+data_stack = deque()
+stack_lock = threading.Lock()
 
 command_to_number = {'Q': 0, 'E' : 1, 'R': 2, 'F': 3, 'FIRE': 4}
 
@@ -114,7 +122,7 @@ def get_latest_result():
 @app.route('/info', methods=['POST'])
 def info():
     global striked_target
-    global fired
+    global striked_buffer
     global is_env_start
     data = request.get_json()
     shared_data.set_data(data)
@@ -131,9 +139,12 @@ def info():
 
     # 관측된 포탄 낙하 결과를 반영하여 에피소드를 리셋합니다.
     if striked_target:
-        fired = False
+        striked_buffer += 1
+    if striked_buffer > 2:
+        striked_buffer = 0
         striked_target = None
         is_env_start = False
+        data_stack.clear()
         return jsonify({"status": "success", "control": "reset"})
     return jsonify({"status": "success", "control": ""})
 
@@ -268,19 +279,61 @@ def update_bullet():
     return jsonify({"status": "OK", "message": "Bullet impact data received"})
 
 
+class TankEnv(gym.Env):
+    def __init__(self, max_steps = 1000):
+        super().__init__() 
+        # 연속형 환경 관측
+        self.observation_space = Dict({
+            "image": Box(low=0, high=255, shape=(128, 128, 2), dtype=np.uint8),  # RGB 이미지
+            "sensors": Box(low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32)  # 4개의 센서 값
+        })
+        # 이산형 행동 출력
+        self.action_space = MultiDiscrete([5, 10])
+        self.steps = 0
+        self.max_steps = max_steps
+        self.weight_bins = np.linspace(0.05, 0.5, 10)
+
+        print('Tank Env initialized')
+        
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        # 시뮬레이터 초기화 및 초기 관측값 반환
+        # options를 통해서 각종 자료를 flask 서버에서 넘겨보자 
+        image = options['image']  # 더미 이미지
+        sensors = options['sensor_data']  # 더미 센서 데이터
+        self.step_count = 0
+        print('Environment has been reset')
+        return {"image": image, "sensors": sensors}, {}
+    
+    def step(self, action, option=None):
+        new_data = data_stack.pop()
+        striked = option
+        image = new_data['image']
+        sensors = new_data['sensor_data']
+        self.step_count += 1
+        reward = 0
+        reward -= 0.02 
+        if striked == 'enemy':
+            reward += 10
+            terminated = True
+        elif striked != None:
+            reward -= 1.8
+            terminated = True
+        if self.step_count >= self.max_steps:
+            truncated = True
+            reward -= 1
+        info = {}
+        print('Step finished')
+        return {"image": image, "sensor_data": sensors}, reward, terminated, truncated, info
+
+env = TankEnv(max_steps=200)
+
 @app.route('/get_action', methods=['GET'])
 def get_action():
-    global fired
-    global ready_to_shot
-    # 사격 후 대기
-    if fired:
-        print('Waiting to observe a bullet')
-        return jsonify({"turret": "", "weight": 0.0})
-    # 시작하자마자 발포하는 것을 방지하기 위한 버퍼
-    if not(ready_to_shot):
-        ready_to_shot = True
-        print('Set to ready')
-        return jsonify({"turret": "", "weight": 0.0})
+    global prev_action
+    global step_check
+    global striked_target
     # 사격 제원 산출
     data = shared_data.get_data()
     context = fire.Initialize(data)
@@ -293,24 +346,30 @@ def get_action():
     b_x, b_y, b_z = data['playerBodyX'] ,data['playerBodyY'], data['playerBodyZ']
     data = {'image':image, 'sensor_data':[x,y,z,speed,t_x,t_y,b_x,b_y,b_z]}
     # 큐에 저장
-    data_queue.put(data)
-    if result == None:
-        return jsonify({"turret": "", "weight": 0.0})
-    command = {"turret": result[0], "weight": result[1]}
-    action = [command_to_number[result[0]], result[1]]
-    if command['turret'] == 'FIRE':
-        fired = True
-        ready_to_shot = False
-    print(f"🔫 Action Command: {command}")
-    return jsonify(command)
+    data_stack.append(data)
+    # 스텝 단계 이행
+    if step_check:
+        result = env.step(prev_action, option=striked_target)
+        step_check = False
+        print('👍 Result:' , result[1])
+        return jsonify({"turret": "Q", "weight": 0.0})
+    # 데이터 수집 이행
+    else:
+        if result == None:
+            return jsonify({"turret": "Q", "weight": 0.0})
+        command = {"turret": result[0], "weight": result[1]}
+        print(f"🔫 Action Command: {command}")
+        prev_action = [command_to_number[result[0]], result[1]]
+        step_check = True
+        return jsonify(command)
 
 @app.route('/init', methods=['GET'])
 def init():
     global rng
-    global calculating
-    if calculating:
+    global initiating
+    if initiating:
         return jsonify({"status": "Calculating", "message": "Some Calculation are going on..."}), 102
-    calculating = True
+    initiating = True
     curriculum = 40
     while True:
         random_coord = rng.integers(low=60, high=240, size=4)
@@ -341,7 +400,7 @@ def init():
         "saveLidarData": False
     }
     print("🛠️ Initialization config sent via /init:", config["blStartX"], config["blStartZ"], config["rdStartX"], config["rdStartZ"])
-    calculating = False
+    initiating = False
     # send_reset_message()
     return jsonify(config)
 

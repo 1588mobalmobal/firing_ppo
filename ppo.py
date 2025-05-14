@@ -2,6 +2,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.policies import ActorCriticPolicy
 import torch
 import torch.nn as nn
 import gymnasium as gym
@@ -20,10 +21,10 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
             nn.Flatten(),
         )
         with torch.no_grad():
-            sample_image = torch.zeros(1, 3, 84, 84)
+            sample_image = torch.zeros(1, 3, 128, 128) # 여기는 원래 이미지 데이터로 (batch, channel, height, width)
             n_flatten = self.cnn(sample_image).shape[1]
         self.mlp = nn.Sequential(
-            nn.Linear(4, 64),
+            nn.Linear(9, 64),
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
@@ -34,33 +35,39 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         )
 
     def forward(self, observations):
-        image = observations["image"].permute(0, 3, 1, 2).float() / 255.0
+        image = observations["image"].permute(0, 3, 1, 2).float() / 255.0 # 여긴 입력 이미지의 형태를 잘 보고 결정하자자
         image_features = self.cnn(image)
         sensor_features = self.mlp(observations["sensors"])
         combined = torch.cat([image_features, sensor_features], dim=1)
         return self.linear(combined)
+    
+# 커스텀 정책 정의
+class CustomPolicy(ActorCriticPolicy):
+    def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
+        super().__init__(observation_space, action_space, lr_schedule, **kwargs)
+        self.features_extractor = CustomFeaturesExtractor(observation_space)
 
-# 환경 및 모델
-env = CustomEnv()
-env = DummyVecEnv([lambda: env])
-env = VecNormalize(env, norm_obs=True, norm_reward=True)
-
-model = PPO(
-    policy="MultiInputActorCriticPolicy",
-    env=env,
-    policy_kwargs={"features_extractor_class": CustomFeaturesExtractor},
-    learning_rate=3e-4,
-    n_steps=2048,
-    batch_size=64,
-    n_epochs=10,
-    verbose=1,
-    tensorboard_log="./tb_logs/",
-)
-
-# 학습
-eval_env = CustomEnv()
-eval_env = DummyVecEnv([lambda: eval_env])
-eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False)
-eval_callback = EvalCallback(eval_env, best_model_save_path="./best_model/", eval_freq=10000)
-model.learn(total_timesteps=100000, callback=eval_callback)
-model.save("ppo_multidiscrete")
+# PPO 초기화
+def initialize_ppo():
+    global model, env, rollout_buffer
+    env = CustomEnv()
+    env = DummyVecEnv([lambda: env])
+    rollout_buffer = RolloutBuffer(
+        buffer_size=n_steps,
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        device="cpu",
+        gae_lambda=0.95,
+        gamma=0.99,
+        n_envs=1,
+    )
+    model = PPO(
+        policy="MultiInputActorCriticPolicy",
+        env=env,
+        policy_kwargs={"features_extractor_class": CustomFeaturesExtractor},
+        learning_rate=3e-4,
+        n_steps=n_steps,
+        batch_size=64,
+        n_epochs=10,
+        verbose=1,
+    )

@@ -101,8 +101,8 @@ rgb_to_class_map = {
 directory = os.getcwd()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-left_dir = '/mnt/c/Users/kbh11/OneDrive/Documents/Tank Challenge/capture_images/L'
-right_dir = '/mnt/c/Users/kbh11/OneDrive/Documents/Tank Challenge/capture_images/R'
+left_dir = '/mnt/c/Users/kbh11/Documents/Tank Challenge/capture_images/L'
+right_dir = '/mnt/c/Users/kbh11/Documents/Tank Challenge/capture_images/R'
 result_dir = "results"
 
 def init_model():
@@ -272,16 +272,20 @@ def get_depth_and_class(seg_model, image_processor):
     left_items, left_item_dir = get_item_dir(left_dir)
     right_items, right_item_dir = get_item_dir(right_dir)
 
-    left_prediction = predict_segmentation(left_item_dir, seg_model, image_processor)
-    right_prediction = predict_segmentation(right_item_dir, seg_model, image_processor)
-
     img_left = cv2.imread(left_item_dir, cv2.IMREAD_GRAYSCALE)
     img_right = cv2.imread(right_item_dir, cv2.IMREAD_GRAYSCALE)
 
-    # for item in left_items:
-    #     os.remove(os.path.join(left_dir, item))
-    # for item in right_items:
-    #     os.remove(os.path.join(right_dir, item))
+    left_prediction = predict_segmentation(left_item_dir, seg_model, image_processor)
+    right_prediction = predict_segmentation(right_item_dir, seg_model, image_processor)
+
+    try:
+        for item in left_items:
+            os.remove(os.path.join(left_dir, item))
+        for item in right_items:
+            os.remove(os.path.join(right_dir, item))
+    except Exception as e:
+        print(e)
+
 
     img_left_resized = cv2.resize(img_left, (128, 128), interpolation=cv2.INTER_NEAREST)
     img_right_resized = cv2.resize(img_right, (128, 128), interpolation=cv2.INTER_NEAREST)

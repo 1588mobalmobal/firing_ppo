@@ -31,16 +31,23 @@ class TankEnv(gym.Env):
         print('Environment has been reset')
         return {"image": image, "sensors": sensors}, {}
     
-    def step(self, action, options=None):
-        # action: [action_idx, weight_idx]
-        action_idx, weight_idx = action
-        weight = self.weight_bins[weight_idx]
-        # 예: ZeroMQ/ROS로 행동 전송, 이미지/센서 데이터 수신
-        image = np.zeros((128, 128, 2), dtype=np.uint8)  # 더미 이미지
-        sensors = np.zeros(9, dtype=np.float32)  # 더미 센서 데이터
-        reward = 0.0  # 보상 계산
+    def step(self, action, option=None):
+        new_data = data_stack.pop()
+        striked = option
+        image = new_data['image']
+        sensors = new_data['sensor_data']
         self.step_count += 1
-        terminated = self.step_count >= self.max_steps
-        truncated = False
+        reward = 0
+        reward -= 0.02 
+        if striked == 'enemy':
+            reward += 10
+            terminated = True
+        elif striked != None:
+            reward -= 1.8
+            terminated = True
+        if self.step_count >= self.max_steps:
+            truncated = True
+            reward -= 1
         info = {}
-        return {"image": image, "sensors": sensors}, reward, terminated, truncated, info
+        print('Step finished')
+        return {"image": image, "sensor_data": sensors}, reward, terminated, truncated, info
