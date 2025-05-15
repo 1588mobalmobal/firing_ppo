@@ -46,28 +46,3 @@ class CustomPolicy(ActorCriticPolicy):
     def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
         super().__init__(observation_space, action_space, lr_schedule, **kwargs)
         self.features_extractor = CustomFeaturesExtractor(observation_space)
-
-# PPO 초기화
-def initialize_ppo():
-    global model, env, rollout_buffer
-    env = CustomEnv()
-    env = DummyVecEnv([lambda: env])
-    rollout_buffer = RolloutBuffer(
-        buffer_size=n_steps,
-        observation_space=env.observation_space,
-        action_space=env.action_space,
-        device="cpu",
-        gae_lambda=0.95,
-        gamma=0.99,
-        n_envs=1,
-    )
-    model = PPO(
-        policy="MultiInputActorCriticPolicy",
-        env=env,
-        policy_kwargs={"features_extractor_class": CustomFeaturesExtractor},
-        learning_rate=3e-4,
-        n_steps=n_steps,
-        batch_size=64,
-        n_epochs=10,
-        verbose=1,
-    )
