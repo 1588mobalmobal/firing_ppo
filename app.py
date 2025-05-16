@@ -58,7 +58,9 @@ os.makedirs(result_dir, exist_ok=True)
 latest_result = os.path.join(result_dir, "latest_result.png")
 
 # 강화학습 관련 변수
+device = None
 is_env_start = False
+is_episode_done = False
 step_check = False
 prev_data = None
 prev_result = None
@@ -83,7 +85,7 @@ class TankEnv(gym.Env):
         # 연속형 환경 관측
         self.observation_space = Dict({
             "image": Box(low=0, high=255, shape=(128, 128, 2), dtype=np.uint8),  # RGB 이미지
-            "sensors": Box(low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32)  # 9개의 센서 값
+            "sensor_data": Box(low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32)  # 9개의 센서 값
         })
         # 이산형 행동 출력
         self.action_space = MultiDiscrete([5, 10])
@@ -100,16 +102,17 @@ class TankEnv(gym.Env):
         # options를 통해서 각종 자료를 flask 서버에서 넘겨보자
         if options:
             image = options['image']  # 더미 이미지
-            sensors = options['sensor_data']  # 더미 센서 데이터
+            sensor_data = options['sensor_data']  # 더미 센서 데이터
         self.step_count = 0
         print('Environment has been reset')
-        return {"image": image, "sensors": sensors}, {}
+        return {"image": image, "sensor_data": sensor_data}, {}
     
-    def step(self, action, data, option=None):
-        new_data = data
-        striked = option
+    def step(self, action):
+        data = data_stack.pop()
+        new_data = data['data']
+        striked = data['striked_target']
         image = new_data['image']
-        sensors = new_data['sensor_data']
+        sensor_data = new_data['sensor_data']
         self.step_count += 1
         reward = 0
         reward -= 0.02 
@@ -128,14 +131,14 @@ class TankEnv(gym.Env):
             reward -= 1
         info = {}
         print('Step finished')
-        return {"image": image, "sensor_data": sensors}, reward, terminated, truncated, info
+        return {"image": image, "sensor_data": sensor_data}, reward, terminated, truncated, info
     
 # 커스텀 피처 추출기 (이전 질문 참조)
 class CustomFeaturesExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 256):
         super().__init__(observation_space, features_dim)
         self.cnn = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=8, stride=4, padding=0),
+            nn.Conv2d(2, 32, kernel_size=8, stride=4, padding=0),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
             nn.ReLU(),
@@ -144,7 +147,7 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
             nn.Flatten(),
         )
         with torch.no_grad():
-            sample_image = torch.zeros(1, 3, 128, 128) # 여기는 원래 이미지 데이터로 (batch, channel, height, width)
+            sample_image = torch.zeros(1, 2, 128, 128) # 여기는 원래 이미지 데이터로 (batch, channel, height, width)
             n_flatten = self.cnn(sample_image).shape[1]
         self.mlp = nn.Sequential(
             nn.Linear(9, 64),
@@ -160,35 +163,61 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
     def forward(self, observations):
         image = observations["image"].permute(0, 3, 1, 2).float() / 255.0 # 여긴 입력 이미지의 형태를 잘 보고 결정하자
         image_features = self.cnn(image)
-        sensor_features = self.mlp(observations["sensors"])
+        sensor_features = self.mlp(observations["sensor_data"])
         combined = torch.cat([image_features, sensor_features], dim=1)
         return self.linear(combined)
     
-# 커스텀 정책 정의
-class CustomPolicy(ActorCriticPolicy):
-    def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
-        super().__init__(observation_space, action_space, lr_schedule, **kwargs)
-        self.features_extractor = CustomFeaturesExtractor(observation_space)
 
-class CustomVecEnv(DummyVecEnv):
+# 커스텀 DummyVecEnv
+class CustomDummyVecEnv(DummyVecEnv):
     def reset(self, seed=None, options=None):
-        self.buf_obs = {key: [] for key in self.observation_space.spaces.keys()}
+        # 배치 차원 포함한 버퍼 초기화
+        self.buf_obs = {
+            key: np.zeros((self.num_envs,) + self.observation_space[key].shape, dtype=self.observation_space[key].dtype)
+            for key in self.observation_space.spaces.keys()
+        }
+        infos = []
         for env_idx, env in enumerate(self.envs):
             obs, info = env.reset(seed=seed, options=options)
             for key in self.buf_obs:
-                self.buf_obs[key].append(obs[key])
-        return {key: np.array(val, dtype=self.observation_space[key].dtype) for key, val in self.buf_obs.items()}, info
+                self.buf_obs[key][env_idx] = obs[key]
+            infos.append(info)
+        # print(f"Reset buf_obs: image={self.buf_obs['image'].shape}, sensor_data={self.buf_obs['sensor_data'].shape}")
+        return self.buf_obs, infos[0] if infos else {}
 
+    def step_async(self, actions):
+        self.step_results = []
+        for env_idx, env in enumerate(self.envs):
+            # Call env.step() directly, store results
+            result = env.step(actions[env_idx])
+            self.step_results.append(result)
+
+    def step_wait(self):
+        self.buf_obs = {
+            key: np.zeros((self.num_envs,) + self.observation_space[key].shape, dtype=self.observation_space[key].dtype)
+            for key in self.observation_space.spaces.keys()
+        }
+        rewards, dones, infos = [], [], []
+        for i, (obs, rew, terminated, truncated, info) in enumerate(self.step_results):
+            done = terminated or truncated
+            for key in self.buf_obs:
+                self.buf_obs[key][i] = obs[key]
+            rewards.append(rew)
+            dones.append(done)
+            infos.append(info)
+        print(f"Step buf_obs: image={self.buf_obs['image'].shape}, sensor_data={self.buf_obs['sensor_data'].shape}, image_nonzero={np.any(self.buf_obs['image'])}")
+        return self.buf_obs, np.array(rewards), np.array(dones), infos
+    
 # PPO 초기화
 def initialize_ppo():
-    global model, env, rollout_buffer
+    global model, env, rollout_buffer, device
     env = TankEnv(total_steps)
-    env = CustomVecEnv([lambda: env])
+    env = CustomDummyVecEnv([lambda: env])
     rollout_buffer = DictRolloutBuffer(
         buffer_size=n_steps,
         observation_space=env.observation_space,
         action_space=env.action_space,
-        device="cpu",
+        device=device,
         gae_lambda=0.95,
         gamma=0.99,
         n_envs=1,
@@ -204,8 +233,6 @@ def initialize_ppo():
         verbose=1,
     )
 #####################################################################################################
-
-initialize_ppo()
 
 # 각도 변환용
 def change_degree(my_d):
@@ -251,6 +278,7 @@ def info():
     global striked_target
     global striked_buffer
     global is_env_start
+    global is_episode_done
     data = request.get_json()
     shared_data.set_data(data)
     # 세그멘테이션, 깊이 2채널 128 * 128 이미지 받아오기
@@ -265,10 +293,7 @@ def info():
         is_env_start = True
 
     # 관측된 포탄 낙하 결과를 반영하여 에피소드를 리셋합니다.
-    if striked_target:
-        striked_buffer += 1
-    if striked_buffer > 2:
-        striked_buffer = 0
+    if is_episode_done:
         striked_target = None
         is_env_start = False
         data_stack.clear()
@@ -413,6 +438,8 @@ def get_action():
     global striked_target
     global step_counter
     global n_steps
+    global device
+    global is_episode_done
     # 사격 제원 산출
     data = shared_data.get_data()
     context = fire.Initialize(data)
@@ -424,28 +451,28 @@ def get_action():
     speed, t_x, t_y  = data['playerSpeed'], data['playerTurretX'], data['playerTurretY']
     b_x, b_y, b_z = data['playerBodyX'] ,data['playerBodyY'], data['playerBodyZ']
     origin_data = {'image':image, 'sensor_data':[x,y,z,speed,t_x,t_y,b_x,b_y,b_z]}
-    data = {'image': torch.tensor(image, dtype=torch.float32), 'sensor_data': torch.tensor([x,y,z,speed,t_x,t_y,b_x,b_y,b_z], dtype=torch.float32)}
-    # 큐에 저장
-    data_stack.append(data)
+    data = {'image': torch.tensor(image, dtype=torch.float32).unsqueeze(0).to(device),
+            'sensor_data': torch.tensor([x,y,z,speed,t_x,t_y,b_x,b_y,b_z], dtype=torch.float32).unsqueeze(0).to(device)}
+    data_stack.append({'data':origin_data, 'striked_target':striked_target})
     # 행동 전달 및 스텝 단계 이행
     if step_check:
         # 여기서 변화한 상태와 보상 및 종료여부를 가져오지롱
-        new_obs, reward, terminated, truncated, info = env.step(prev_result[0], data=prev_data, options=striked_target)
+        new_obs, reward, done, info = env.step(prev_result[0])
         rollout_buffer.add(
             obs=prev_data,
-            actions=prev_result[0],
-            rewards=np.array([reward]),
-            dones=np.array([terminated]),
-            values=prev_result[1],
-            log_probs=prev_result[2],
-            episode_starts=np.array([False]) # 여기는 추후에 알아봐야 한다. 
+            action=prev_result[0].cpu(),
+            reward=np.array([reward]),
+            # done=np.array([done]),
+            value=prev_result[1].cpu(),
+            log_prob=prev_result[2].cpu(),
+            episode_start=np.array([False])
         )
         step_counter += 1
 
         if step_counter % n_steps == 0:
             with torch.no_grad():
                 next_value = model.policy.predict_values(new_obs)
-            rollout_buffer.compute_returns_and_advantage(last_values=next_value, dones=np.array([terminated]))
+            rollout_buffer.compute_returns_and_advantage(last_values=next_value, dones=np.array([done]))
             model.train()
             rollout_buffer.reset()
         
@@ -456,23 +483,23 @@ def get_action():
             return {"status": "Learning completed"}, 200
         
         # 에피소드 리셋
-        if terminated or truncated:
-            obs, _ = env.reset()
-            with obs_lock:
-                prev_data = obs
+        if done:
+            is_episode_done = True
+            # obs, _ = env.reset()
+            # with obs_lock:
+            #     prev_data = obs
         step_check = False
         print('👍 Result:' , result[1])
         return jsonify({"turret": "Q", "weight": 0.0})
     # 환경 수집 및 행동 출력 수행
     else: # 그럼 여기서 확률적 행동을 산출해야겠지?
-        if result == None:
-            return jsonify({"turret": "Q", "weight": 0.0})
-        prev_data = data
+        prev_data = origin_data
         with torch.no_grad():
             action, value, log_prob = model.policy(data)
-        current_action = {'turret': command_to_number[action[0]], 'weight' : action[1]} # 모델 출력 값
+        print(f'Action: {action}, value {value}, log_prob {log_prob}')
+        # current_action = {'turret': command_to_number[action[0]], 'weight' : action[1]} # 모델 출력 값
         command = {"turret": result[0], "weight": result[1]} # 규칙 기반 출력 값
-        # print(f"🔫 Action Command: {command}")
+        print(f"🔫 Action Command: {command}")
         prev_result = [action, value, log_prob]
         step_check = True
         return jsonify(command)
@@ -523,7 +550,13 @@ def start():
     # print("🚀 /start command received")``
     
     return jsonify({"control": ""})
-    
+
+def init_device():
+    global device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 if __name__ == '__main__':
+    init_device()
+    initialize_ppo()
     app.run(host='0.0.0.0', port=5052, debug=True)
 
