@@ -348,69 +348,69 @@ def set_destination():
 
 @app.route('/get_move', methods=['GET'])
 def get_move():
-    # global enemy_detected
-    # global enemy_list
-    # global destination_buffer
-    # if enemy_detected:
-    #     data = shared_data.get_data()
-    #     if enemy_list == None:
-    #         print('Stop the tank')
-    #         return jsonify({"move": "STOP"})
-    #     enemies = len(enemy_list)
-    #     if enemies == 1:
-    #         # 사정거리 안에 있으면 그 자리에서 멈춰서 쏘자
-    #         distance = enemy_list[0]['distance']
-    #         if distance < 105:
-    #             print('Stop the tank')
-    #             return jsonify({"move": "STOP"})
-    #         else:
-    #             x = data['playerPos']['x']
-    #             y = data['playerPos']['y']
-    #             z = data['playerPos']['z']
-    #             turret_x = data['playerTurretX']
-    #             enemy_x, enemy_z = get_target_coord(x, z, turret_x, distance)
-    #             if destination_buffer == 0:
-    #                 nav_controller.set_destination(f'{enemy_x},{y},{enemy_z}')
-    #                 print(f'Destination has been changed: {enemy_x},{y},{enemy_z}')
-    #                 destination_buffer += 1
-    #             else:
-    #                 destination_buffer += 1
-    #                 if destination_buffer > 16:
-    #                     destination_buffer = 0
-    #             command = nav_controller.get_move()
-    #             print(f'Moving Command: {command}')
-    #             return jsonify(command)
-    #     else:
-    #         target_id = 0
-    #         target_distance = 1000
-    #         for i, enemy in enumerate(enemy_list):
-    #             if enemy.get['distance'] < target_distance:
-    #                 target_id = i
-    #                     # 사정거리 안에 있으면 그 자리에서 멈춰서 쏘자
-    #         distance = enemy_list[target_id]['distance']
-    #         if distance < 100:
-    #             print('Stop the tank')
-    #             return jsonify({"move": "STOP"})
-    #         else:
-    #             x = data['playerPos']['x']
-    #             y = data['playerPos']['y']
-    #             z = data['playerPos']['z']
-    #             turret_x = data['playerTurretX']
-    #             enemy_x, enemy_z = get_target_coord(x, z, turret_x, distance)
-    #             if destination_buffer == 0:
-    #                 nav_controller.set_destination(f'{enemy_x},{y},{enemy_z}')
-    #                 print(f'Destination has been changed: {enemy_x},{y},{enemy_z}')
-    #                 destination_buffer += 1
-    #             else:
-    #                 destination_buffer += 1
-    #                 if destination_buffer > 16:
-    #                     destination_buffer = 0
-    #             command = nav_controller.get_move()
-    #             print(f'Moving Command: {command}')
-    #             return jsonify(command)
-    # else:
-    #     command = nav_controller.get_move()
-    #     print(f'Moving Command: {command}')
+    global enemy_detected
+    global enemy_list
+    global destination_buffer
+    if enemy_detected:
+        data = shared_data.get_data()
+        if enemy_list == None:
+            print('Stop the tank')
+            return jsonify({"move": "STOP"})
+        enemies = len(enemy_list)
+        if enemies == 1:
+            # 사정거리 안에 있으면 그 자리에서 멈춰서 쏘자
+            distance = enemy_list[0]['distance']
+            if distance < 105:
+                print('Stop the tank')
+                return jsonify({"move": "STOP"})
+            else:
+                x = data['playerPos']['x']
+                y = data['playerPos']['y']
+                z = data['playerPos']['z']
+                turret_x = data['playerTurretX']
+                enemy_x, enemy_z = get_target_coord(x, z, turret_x, distance)
+                if destination_buffer == 0:
+                    nav_controller.set_destination(f'{enemy_x},{y},{enemy_z}')
+                    print(f'Destination has been changed: {enemy_x},{y},{enemy_z}')
+                    destination_buffer += 1
+                else:
+                    destination_buffer += 1
+                    if destination_buffer > 16:
+                        destination_buffer = 0
+                command = nav_controller.get_move()
+                print(f'Moving Command: {command}')
+                return jsonify(command)
+        else:
+            target_id = 0
+            target_distance = 1000
+            for i, enemy in enumerate(enemy_list):
+                if enemy.get['distance'] < target_distance:
+                    target_id = i
+                        # 사정거리 안에 있으면 그 자리에서 멈춰서 쏘자
+            distance = enemy_list[target_id]['distance']
+            if distance < 100:
+                print('Stop the tank')
+                return jsonify({"move": "STOP"})
+            else:
+                x = data['playerPos']['x']
+                y = data['playerPos']['y']
+                z = data['playerPos']['z']
+                turret_x = data['playerTurretX']
+                enemy_x, enemy_z = get_target_coord(x, z, turret_x, distance)
+                if destination_buffer == 0:
+                    nav_controller.set_destination(f'{enemy_x},{y},{enemy_z}')
+                    print(f'Destination has been changed: {enemy_x},{y},{enemy_z}')
+                    destination_buffer += 1
+                else:
+                    destination_buffer += 1
+                    if destination_buffer > 16:
+                        destination_buffer = 0
+                command = nav_controller.get_move()
+                print(f'Moving Command: {command}')
+                return jsonify(command)
+    else:
+        command = nav_controller.get_move()
+        print(f'Moving Command: {command}')
         return jsonify({"move":"STOP"})
 
 @app.route('/visualization', methods=['GET'])
@@ -473,6 +473,7 @@ def get_action():
             with torch.no_grad():
                 next_value = model.policy.predict_values(new_obs)
             rollout_buffer.compute_returns_and_advantage(last_values=next_value, dones=np.array([done]))
+            print('Training...')
             model.train()
             rollout_buffer.reset()
         
@@ -498,7 +499,7 @@ def get_action():
             action, value, log_prob = model.policy(data)
         print(f'Action: {action}, value {value}, log_prob {log_prob}')
         # current_action = {'turret': command_to_number[action[0]], 'weight' : action[1]} # 모델 출력 값
-        command = {"turret": result[0], "weight": result[1]} # 규칙 기반 출력 값
+        command = {"turret": action[0], "weight": action[1]} # 규칙 기반 출력 값
         print(f"🔫 Action Command: {command}")
         prev_result = [action, value, log_prob]
         step_check = True
@@ -558,5 +559,5 @@ def init_device():
 if __name__ == '__main__':
     init_device()
     initialize_ppo()
-    app.run(host='0.0.0.0', port=5052, debug=True)
+    app.run(host='0.0.0.0', port=5053, debug=True)
 
