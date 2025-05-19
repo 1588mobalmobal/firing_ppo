@@ -74,7 +74,7 @@ batch_size = 128
 total_steps = 2048
 step_counter = 0
 is_bc_collecting = True
-target_bc_count = 10
+target_bc_count = 128
 bc_dataset = []
 training = False
 # 타이밍 동기화를 위한 스택
@@ -222,15 +222,15 @@ def initialize_ppo():
     global model, env, rollout_buffer, device
     env = TankEnv(total_steps)
     env = CustomDummyVecEnv([lambda: env])
-    rollout_buffer = DictRolloutBuffer(
-        buffer_size=n_steps,
-        observation_space=env.observation_space,
-        action_space=env.action_space,
-        device=device,
-        gae_lambda=0.95,
-        gamma=0.99,
-        n_envs=1,
-    )
+    # rollout_buffer = DictRolloutBuffer(
+    #     buffer_size=n_steps,
+    #     observation_space=env.observation_space,
+    #     action_space=env.action_space,
+    #     device=device,
+    #     gae_lambda=0.95,
+    #     gamma=0.99,
+    #     n_envs=1,
+    # )
     model = PPO(
         policy=MultiInputActorCriticPolicy,
         env=env,
@@ -244,7 +244,7 @@ def initialize_ppo():
     )
     # Explicitly set logger
     model._logger = utils.configure_logger(verbose=model.verbose, tensorboard_log=None, tb_log_name="PPO")
-    return model, env, rollout_buffer
+    return model, env
 #####################################################################################################
 
 #####################################################################################################
@@ -631,9 +631,11 @@ def start():
 def init_device():
     global device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return device
+
 
 if __name__ == '__main__':
     init_device()
     initialize_ppo()
-    app.run(host='0.0.0.0', port=5055, debug=True)
+    app.run(host='0.0.0.0', port=5055)
 
