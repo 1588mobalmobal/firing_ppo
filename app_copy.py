@@ -16,6 +16,7 @@ from stable_baselines3.common.buffers import DictRolloutBuffer
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.policies import MultiInputActorCriticPolicy
+from stable_baselines3.common import utils
 import segformer_b0 as seg
 import path_finding as pf
 import firing as fire
@@ -67,17 +68,19 @@ prev_result = None
 env = None
 model = None
 rollout_buffer = None
-n_steps = 256
-total_steps = 1024
+n_steps = 512
+batch_size = 128
+total_steps = 2048
 step_counter = 0
 is_bc_collecting = True
 bc_dataset = []
 training = False
 # 타이밍 동기화를 위한 스택
 data_stack = deque()
-stack_lock = threading.Lock()
-action_lock = threading.Lock()
-obs_lock = threading.Lock()
+training_lock = threading.Lock()
+# 사격 버퍼
+firing_buffer = 0
+prev_command = None
 
 command_to_number = {'Q': 0, 'E' : 1, 'R': 2, 'F': 3, 'FIRE': 4}
 number_to_command = {0: 'Q', 1 : 'E', 2: 'R', 3: 'F', 4: 'FIRE'}
@@ -91,7 +94,7 @@ class TankEnv(gym.Env):
         super().__init__() 
         # 연속형 환경 관측
         self.observation_space = Dict({
-            "image": Box(low=0, high=255, shape=(128, 128, 2), dtype=np.uint8),  # RGB 이미지
+            "image": Box(low=0, high=255, shape=(2, 128, 128), dtype=np.uint8),  # RGB 이미지
             "sensor_data": Box(low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32)  # 9개의 센서 값
         })
         # 이산형 행동 출력
@@ -168,7 +171,7 @@ class CustomFeaturesExtractor(BaseFeaturesExtractor):
         )
 
     def forward(self, observations):
-        image = observations["image"].permute(0, 3, 1, 2).float() / 255.0 # 여긴 입력 이미지의 형태를 잘 보고 결정하자
+        image = observations["image"].float() / 255.0 # 여긴 입력 이미지의 형태를 잘 보고 결정하자
         image_features = self.cnn(image)
         sensor_features = self.mlp(observations["sensor_data"])
         combined = torch.cat([image_features, sensor_features], dim=1)
@@ -200,18 +203,17 @@ class CustomDummyVecEnv(DummyVecEnv):
 
     def step_wait(self):
         self.buf_obs = {
-            key: np.zeros((self.num_envs,) + self.observation_space[key].shape, dtype=self.observation_space[key].dtype)
-            for key in self.observation_space.spaces.keys()
+            "image": np.zeros((self.num_envs, 2, 128, 128), dtype=np.uint8),
+            "sensor_data": np.zeros((self.num_envs, 9), dtype=np.float32)
         }
         rewards, dones, infos = [], [], []
         for i, (obs, rew, terminated, truncated, info) in enumerate(self.step_results):
             done = terminated or truncated
-            for key in self.buf_obs:
-                self.buf_obs[key][i] = obs[key]
+            self.buf_obs["image"][i] = np.copy(obs["image"])
+            self.buf_obs["sensor_data"][i] = np.copy(obs["sensor_data"])
             rewards.append(rew)
             dones.append(done)
             infos.append(info)
-        # print(f"Step buf_obs: image={self.buf_obs['image'].shape}, sensor_data={self.buf_obs['sensor_data'].shape}, image_nonzero={np.any(self.buf_obs['image'])}")
         return self.buf_obs, np.array(rewards), np.array(dones), infos
     
 # PPO 초기화
@@ -234,10 +236,14 @@ def initialize_ppo():
         policy_kwargs={"features_extractor_class": CustomFeaturesExtractor},
         learning_rate=3e-4,
         n_steps=n_steps,
-        batch_size=64,
+        batch_size=batch_size,
         n_epochs=10,
         verbose=1,
+        device=device,
     )
+    # Explicitly set logger
+    model._logger = utils.configure_logger(verbose=model.verbose, tensorboard_log=None, tb_log_name="PPO")
+    return model, env, rollout_buffer
 #####################################################################################################
 
 #####################################################################################################
@@ -287,6 +293,7 @@ def info():
     global is_env_start
     global is_episode_done
     global training
+    global firing_buffer
     if training:
         return jsonify({"status": "success", "control": ""})
     data = request.get_json()
@@ -295,12 +302,13 @@ def info():
     # 환경이 리셋되어 있지 않으면 리셋을 수행합니다.
     if not(is_env_start):
         image = seg.get_depth_and_class(seg_model, image_processor)
-        # 현재 전차 제원을 받아옵니다.
+        # 현재 제원을 받아옵니다.
         x, y, z = data['playerPos']['x'], data['playerPos']['y'], data['playerPos']['z']
         speed, t_x, t_y  = data['playerSpeed'], data['playerTurretX'], data['playerTurretY']
         b_x, b_y, b_z = data['playerBodyX'] ,data['playerBodyY'], data['playerBodyZ']
         env.reset(options={'image':image, 'sensor_data':[x,y,z,speed,t_x,t_y,b_x,b_y,b_z]})
         is_env_start = True
+        firing_buffer = 0
 
     # 관측된 포탄 낙하 결과를 반영하여 에피소드를 리셋합니다.
     if is_episode_done:
@@ -455,7 +463,9 @@ def get_action():
     global is_episode_done
     global bc_dataset
     global training
-    # 사격 제원 산출
+    global firing_buffer
+    global prev_command
+    # 제원 산출
     if training:
         return jsonify({"turret": "Q", "weight": 0.0})
     data = shared_data.get_data()
@@ -467,81 +477,86 @@ def get_action():
     x, y, z = data['playerPos']['x'], data['playerPos']['y'], data['playerPos']['z']
     speed, t_x, t_y  = data['playerSpeed'], data['playerTurretX'], data['playerTurretY']
     b_x, b_y, b_z = data['playerBodyX'] ,data['playerBodyY'], data['playerBodyZ']
-    origin_data = {'image':image, 'sensor_data':[x,y,z,speed,t_x,t_y,b_x,b_y,b_z]}
+    # origin_data = {'image':image, 'sensor_data':[x,y,z,speed,t_x,t_y,b_x,b_y,b_z]}
     data = {'image': torch.tensor(image, dtype=torch.float32).unsqueeze(0).to(device),
             'sensor_data': torch.tensor([x,y,z,speed,t_x,t_y,b_x,b_y,b_z], dtype=torch.float32).unsqueeze(0).to(device)}
-    data_stack.append({'data':origin_data, 'striked_target':striked_target})
+    data_np = {'image': data['image'].cpu(), 'sensor_data': data['sensor_data'].cpu()}
+    data_stack.append({'data':data_np, 'striked_target':striked_target})
     
     # 행동 전달 및 스텝 단계 이행
     if step_check:
         # 여기서 변화한 상태와 보상 및 종료여부를 가져오지롱
         new_obs, reward, done, info = env.step(prev_result[0])
-        print(new_obs, type(new_obs))
-        rollout_buffer.add(
+        print(prev_data['image'].shape)
+        model.rollout_buffer.add(
             obs=prev_data,
             action=prev_result[0].cpu(),
             reward=np.array([reward]),
-            # done=np.array([done]),
             value=prev_result[1].cpu(),
             log_prob=prev_result[2].cpu(),
-            episode_start=np.array([False])
+            episode_start=np.array([done])
         )
         step_counter += 1
 
-        # if step_counter % n_steps == 0:
-        #     with torch.no_grad():
-        #         next_value = model.policy.predict_values(new_obs)
-        #     rollout_buffer.compute_returns_and_advantage(last_values=next_value, dones=np.array([done]))
-        #     print('Training...')
-        #     training = True
-        #     model.train()
-        #     print('Training finished...')
-        #     training = False
-        #     rollout_buffer.reset()
-        
-        # 학습 종료
-        if step_counter >= total_steps:
-            done = True
         
         # 에피소드 리셋
+        if step_counter % n_steps == 0 and model.rollout_buffer.pos >= n_steps:
+            with training_lock:
+                print('Training...')
+                training = True
+                print(f'High: pos: {model.rollout_buffer.pos} / counter: {step_counter} / capa: {model.rollout_buffer.full}')
+                new_obs_torch = {
+                    'image': torch.tensor(new_obs['image'], dtype=torch.float32).to(device),
+                    'sensor_data': torch.tensor(new_obs['sensor_data'], dtype=torch.float32).to(device)
+
+                }
+                with torch.no_grad():
+                    next_value = model.policy.predict_values(new_obs_torch)
+                model.rollout_buffer.compute_returns_and_advantage(last_values=next_value.cpu(), dones=np.array([done]))
+                print(f"obs_image={model.rollout_buffer.observations['image'].shape} / obs_sensor={model.rollout_buffer.observations['sensor_data'].shape}")
+                model.train()
+                print('Training finished...')
+                training = False
+                model.rollout_buffer.reset()
+                is_episode_done = True
+                model.save("ppo_custom_model")
+                # obs, _ = env.reset()
+                # with obs_lock:
+                #     prev_data = obs
+
+        if step_counter >= total_steps:
+            model.save("ppo_custom_model_final")
+            print("Learning completed")
+            return {"status": "Learning completed"}, 200
+        # 에피소드 리셋
         if done:
-            with torch.no_grad():
-                next_value = model.policy.predict_values(new_obs)
-            rollout_buffer.compute_returns_and_advantage(last_values=next_value, dones=np.array([done]))
-            print('Training...')
-            training = True
-            model.train()
-            print('Training finished...')
-            training = False
-            rollout_buffer.reset()
             is_episode_done = True
-            model.save("ppo_custom_model")
-            # obs, _ = env.reset()
-            # with obs_lock:
-            #     prev_data = obs
+
         step_check = False
         print('👍 reward:' , reward)
         return jsonify({"turret": "Q", "weight": 0.0})
     # 환경 수집 및 행동 출력 수행
     else: # 그럼 여기서 확률적 행동을 산출해야겠지?
-        prev_data = origin_data
+        prev_data = data_np
         with torch.no_grad():
             action, value, log_prob = model.policy(data)
-        print(f'Action: {action}, value {value}, log_prob {log_prob}')
-        # print(action.detach().cpu().numpy(), type(action.detach().cpu().numpy()))
         # current_action = {'turret': command_to_number[action[0]], 'weight' : action[1]} # 모델 출력 값
         if is_bc_collecting:
-            print(result)
             action_1 = result[0]
             action_2 = (result[1] // 0.05) * 0.05
             bc_dataset.append({"obs": data, "action": result})
         else:
             action_1 = number_to_command[action.detach().cpu().numpy()[0][0]]
             action_2 = weight_bins[action.detach().cpu().numpy()[0][0]]
-        command = {"turret": action_1, "weight": action_2} # 규칙 기반 출력 값
+        if prev_command == 'FIRE' and prev_command == action_1 and firing_buffer < 6:
+            firing_buffer += 1
+            command = {"turret": 'Q', "weight": '0.0'}
+        else:
+            command = {"turret": action_1, "weight": action_2} # 규칙 기반 출력 값
         print(f"🔫 Action Command: {command}")
         prev_result = [action, value, log_prob]
         step_check = True
+        prev_command = action_1
         return jsonify(command)
 
 @app.route('/init', methods=['GET'])

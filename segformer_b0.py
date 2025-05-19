@@ -331,5 +331,6 @@ def get_depth_and_class(seg_model, image_processor):
     elif disparity < 0:
         shifted_mask[:, disparity:] = 0  # 오른쪽 공백을 0으로 채움
     two_chan = np.dstack([init_depth_map, shifted_mask])
+    two_chan = np.transpose(two_chan, (2, 0, 1))
 
     return two_chan
