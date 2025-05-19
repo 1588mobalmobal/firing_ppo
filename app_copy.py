@@ -1,6 +1,7 @@
 import os
 import math
 import numpy as np
+import pandas as pd
 from collections import deque
 import threading
 from flask import Flask, request, jsonify, send_file, render_template
@@ -73,6 +74,7 @@ batch_size = 128
 total_steps = 2048
 step_counter = 0
 is_bc_collecting = True
+target_bc_count = 10
 bc_dataset = []
 training = False
 # 타이밍 동기화를 위한 스택
@@ -84,7 +86,7 @@ prev_command = None
 
 command_to_number = {'Q': 0, 'E' : 1, 'R': 2, 'F': 3, 'FIRE': 4}
 number_to_command = {0: 'Q', 1 : 'E', 2: 'R', 3: 'F', 4: 'FIRE'}
-weight_bins = np.linspace(0.05, 0.5, 10)
+weight_bins = [0.05, 0.1 , 0.15, 0.2 , 0.25, 0.3 , 0.35, 0.4 , 0.45, 0.5 ]
 
 #####################################################################################################
 # 강화학습 관련 클래스 선언
@@ -101,7 +103,7 @@ class TankEnv(gym.Env):
         self.action_space = MultiDiscrete([5, 10])
         self.steps = 0
         self.max_steps = max_steps
-        self.weight_bins = np.linspace(0.05, 0.5, 10)
+        # self.weight_bins = np.linspace(0.05, 0.5, 10)
 
         print('Tank Env initialized')
         
@@ -140,7 +142,6 @@ class TankEnv(gym.Env):
             terminated = True
             reward -= 1
         info = {}
-        print('Step finished')
         return {"image": image, "sensor_data": sensor_data}, reward, terminated, truncated, info
     
 # 커스텀 피처 추출기 (이전 질문 참조)
@@ -294,6 +295,7 @@ def info():
     global is_episode_done
     global training
     global firing_buffer
+    global is_bc_collecting
     if training:
         return jsonify({"status": "success", "control": ""})
     data = request.get_json()
@@ -309,6 +311,22 @@ def info():
         env.reset(options={'image':image, 'sensor_data':[x,y,z,speed,t_x,t_y,b_x,b_y,b_z]})
         is_env_start = True
         firing_buffer = 0
+
+    if len(bc_dataset) == target_bc_count:
+        images = []
+        sensors = []
+        actions = []
+        print('Saving..')
+        for i in bc_dataset:
+            images.append(i['image'])
+            sensors.append(i['sensor_data'])
+            actions.append(i['action'])
+        np.savez('images.npz', images)
+        np.savez('sensors.npz', sensors)
+        np.savez('actions.npz', actions)
+        
+    if len(bc_dataset) > target_bc_count:
+        is_bc_collecting = False
 
     # 관측된 포탄 낙하 결과를 반영하여 에피소드를 리셋합니다.
     if is_episode_done:
@@ -467,7 +485,7 @@ def get_action():
     global prev_command
     # 제원 산출
     if training:
-        return jsonify({"turret": "Q", "weight": 0.0})
+        return jsonify({"turret": "Q", "weight": 0.05})
     data = shared_data.get_data()
     context = fire.Initialize(data)
     turret = fire.TurretControl(context)
@@ -487,7 +505,6 @@ def get_action():
     if step_check:
         # 여기서 변화한 상태와 보상 및 종료여부를 가져오지롱
         new_obs, reward, done, info = env.step(prev_result[0])
-        print(prev_data['image'].shape)
         model.rollout_buffer.add(
             obs=prev_data,
             action=prev_result[0].cpu(),
@@ -534,7 +551,7 @@ def get_action():
 
         step_check = False
         print('👍 reward:' , reward)
-        return jsonify({"turret": "Q", "weight": 0.0})
+        return jsonify({"turret": "Q", "weight": 0.00})
     # 환경 수집 및 행동 출력 수행
     else: # 그럼 여기서 확률적 행동을 산출해야겠지?
         prev_data = data_np
@@ -543,17 +560,23 @@ def get_action():
         # current_action = {'turret': command_to_number[action[0]], 'weight' : action[1]} # 모델 출력 값
         if is_bc_collecting:
             action_1 = result[0]
-            action_2 = (result[1] // 0.05) * 0.05
-            bc_dataset.append({"obs": data, "action": result})
+            action_2 = round((result[1] // 0.05) * 0.05, 2)
+            action_1_idx = command_to_number[action_1]
+            action_2_idx = weight_bins.index(action_2)
+            image_np = data['image'].cpu()
+            sensor_np = data['sensor_data'].cpu()
+            action_np = np.array([action_1_idx, action_2_idx])
+            # 리스트 저장
+            bc_dataset.append({
+                "image": image_np,
+                "sensor_data": sensor_np,
+                "action": action_np
+            }, )
         else:
             action_1 = number_to_command[action.detach().cpu().numpy()[0][0]]
-            action_2 = weight_bins[action.detach().cpu().numpy()[0][0]]
-        if prev_command == 'FIRE' and prev_command == action_1 and firing_buffer < 6:
-            firing_buffer += 1
-            command = {"turret": 'Q', "weight": '0.0'}
-        else:
-            command = {"turret": action_1, "weight": action_2} # 규칙 기반 출력 값
-        print(f"🔫 Action Command: {command}")
+            action_2 = weight_bins[action.detach().cpu().numpy()[0][1]]
+        command = {"turret": action_1, "weight": action_2} # 규칙 기반 출력 값
+        print(f"🔫 Action Command: {command} / bc_data: {len(bc_dataset)}")
         prev_result = [action, value, log_prob]
         step_check = True
         prev_command = action_1
