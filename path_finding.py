@@ -137,12 +137,12 @@ class Pathfinding:
 # 제어 관련 클래스
 @dataclass
 class NavigationConfig:
-    MOVE_STEP: float = 0.1
-    TOLERANCE: float = 8.0
+    MOVE_STEP: float = 0.1 #
+    TOLERANCE: float = 12.0
     LOOKAHEAD_MIN: float = 1.0
-    LOOKAHEAD_MAX: float = 10.0
-    HEADING_SMOOTHING: float = 0.8
-    STEERING_SMOOTHING: float = 0.7
+    LOOKAHEAD_MAX: float = 14.0
+    HEADING_SMOOTHING: float = 0.7
+    STEERING_SMOOTHING: float = 0.6 # 1에 가까울수록 가파른 변화
     GOAL_WEIGHT: float = 2.0
     SLOW_RADIUS: float = 50.0
     MAX_SPEED: float = 1.0
@@ -153,7 +153,7 @@ class NavigationConfig:
 
     def __post_init__(self):
         if self.WEIGHT_FACTORS is None:
-            self.WEIGHT_FACTORS = {"D": 0.6, "A": 0.6, "W": 0.5, "S": 0.5}
+            self.WEIGHT_FACTORS = {"D": 0.7, "A": 0.7, "W": 0.8, "S": 0.4}
 
 class NavigationController:
     def __init__(self, config: NavigationConfig, pathfinding: Pathfinding, grid: Grid):
